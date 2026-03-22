@@ -16,23 +16,20 @@ Query the Financial Modeling Prep (FMP) API to report upcoming earnings, dividen
 ## Quick Start
 
 ```bash
-# Set your FMP API key
-export FMP_API_KEY="your_api_key"
-
 # Check events for specific tickers (next 7 days)
-python market-events.py --tickers AAPL,MSFT,GOOG
+python3 /home/claw/.openclaw/workspace/skills/market-events/market-events.py --tickers AAPL,MSFT,GOOG
 
 # Use a ticker file
-python market-events.py --file tickers.txt
+python3 /home/claw/.openclaw/workspace/skills/market-events/market-events.py --file tickers.txt
 
 # Combine both, custom range, specific event types
-python market-events.py --tickers NVDA --file watchlist.csv --range 14d --types earnings,dividends
+python3 /home/claw/.openclaw/workspace/skills/market-events/market-events.py --tickers NVDA --file watchlist.csv --range 14d --types earnings,dividends
 ```
 
 ## Usage
 
 ```
-python market-events.py [OPTIONS]
+python3 /home/claw/.openclaw/workspace/skills/market-events/market-events.py [OPTIONS]
 
 Options:
   --tickers TICKERS   Comma-separated list of ticker symbols
