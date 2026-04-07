@@ -1,17 +1,17 @@
 ---
 name: market-events
 description: >
-  Reports upcoming earnings, dividends, and stock splits from FMP for a watchlist
-  of tickers. Accepts a comma-separated ticker list or a file of tickers. Returns
-  events in a given date range (default 7 days). Use when the user asks about
-  upcoming corporate events, earnings dates, dividend schedules, or stock splits
-  for specific tickers.
+  Reports upcoming or recent earnings, dividends, and stock splits from FMP for a
+  watchlist of tickers. Accepts a comma-separated ticker list or a file of tickers.
+  Returns events in a given date range (default 7 days ahead; use negative range
+  like -30d to look back). Use when the user asks about upcoming or past corporate
+  events, earnings dates, dividend schedules, or stock splits for specific tickers.
 metadata: {"openclaw":{"emoji":"📅","requires":{"bins":["python3"],"env":["FMP_API_KEY"]}}}
 ---
 
 # Market Events
 
-Query the Financial Modeling Prep (FMP) API to report upcoming earnings, dividends, and stock splits for a watchlist of tickers.
+Query the Financial Modeling Prep (FMP) API to report upcoming or recent earnings, dividends, and stock splits for a watchlist of tickers.
 
 ## Quick Start
 
@@ -24,6 +24,9 @@ python3 /home/claw/.openclaw/workspace/skills/market-events/market-events.py --f
 
 # Combine both, custom range, specific event types
 python3 /home/claw/.openclaw/workspace/skills/market-events/market-events.py --tickers NVDA --file watchlist.csv --range 14d --types earnings,dividends
+
+# Check past dividends (last 30 days)
+python3 /home/claw/.openclaw/workspace/skills/market-events/market-events.py --tickers AAPL --range -30d --types dividends
 ```
 
 ## Usage
@@ -34,7 +37,8 @@ python3 /home/claw/.openclaw/workspace/skills/market-events/market-events.py [OP
 Options:
   --tickers TICKERS   Comma-separated list of ticker symbols
   --file PATH         Path to a .txt or .csv file of tickers
-  --range RANGE       Lookahead window (e.g. 7d, 14d, 30d). Default: 7d. Max: 90d.
+  --range RANGE       Lookahead/lookback window. Units: d/w/y. Negative = look back.
+                      Examples: 7d, 2w, -30d, -1y. Default: 7d. Max: 365d/52w/1y.
   --format FORMAT     Output format: text, json, or discord. Default: text.
   --types TYPES       Comma-separated event types: earnings,dividends,splits. Default: all.
   -h, --help          Show help message

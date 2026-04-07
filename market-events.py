@@ -18,7 +18,6 @@ FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 
 ENDPOINT_MAP = {
     "earnings": "earnings-calendar",
-    "dividends": "dividends-calendar",
     "splits": "splits-calendar",
 }
 
@@ -27,34 +26,71 @@ EVENT_TYPE_ORDER = {"earnings": 0, "dividends": 1, "splits": 2}
 ALL_TYPES = ["earnings", "dividends", "splits"]
 
 
+def _fix_negative_range(argv):
+    """Merge '--range -30d' into '--range=-30d' so argparse doesn't treat the value as a flag."""
+    fixed = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--range" and i + 1 < len(argv):
+            fixed.append(f"--range={argv[i + 1]}")
+            i += 2
+        else:
+            fixed.append(argv[i])
+            i += 1
+    return fixed
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Report upcoming earnings, dividends, and stock splits for a watchlist of tickers."
+        description="Report upcoming or recent earnings, dividends, and stock splits for a watchlist of tickers."
     )
     parser.add_argument("--tickers", help="Comma-separated list of ticker symbols")
     parser.add_argument("--file", help="Path to a .txt or .csv file of tickers")
     parser.add_argument("--range", default="7d", dest="range_str",
-                        help="Lookahead window (e.g. 7d, 14d, 30d). Default: 7d. Max: 90d.")
+                        help="Lookahead/lookback window. Units: d(ays), w(eeks), y(ear). "
+                             "Negative = look back. Examples: 7d, 2w, -30d, -1y. Default: 7d. Max: 365d/52w/1y.")
     parser.add_argument("--format", choices=["text", "json", "discord"], default="text",
                         help="Output format: text, json, or discord. Default: text.")
     parser.add_argument("--types", help="Comma-separated event types: earnings,dividends,splits. Default: all.")
-    return parser.parse_args()
+    return parser.parse_args(_fix_negative_range(sys.argv[1:]))
 
 
 def parse_range(range_str):
-    """Parse a range string like '7d' into an integer number of days."""
+    """Parse a range string like '7d', '2w', or '-1y' into a signed integer number of days."""
     s = range_str.strip().lower()
-    if s.endswith("d"):
+    multiplier = 1
+    if s.endswith("w"):
+        multiplier = 7
+        s = s[:-1]
+    elif s.endswith("y"):
+        multiplier = 365
+        s = s[:-1]
+    elif s.endswith("d"):
         s = s[:-1]
     try:
-        days = int(s)
+        value = int(s)
     except ValueError:
-        print(f"Error: Invalid range '{range_str}'. Use a number followed by 'd' (e.g. 7d).", file=sys.stderr)
+        print(f"Error: Invalid range '{range_str}'. Use a number + unit (e.g. 7d, 2w, -1y).", file=sys.stderr)
         sys.exit(1)
-    if days < 1 or days > 90:
-        print(f"Error: Range must be between 1d and 90d (got {days}d).", file=sys.stderr)
+    days = value * multiplier
+    if days == 0 or abs(days) > 365:
+        print(f"Error: Range must be between 1 and 365 days (got {abs(days)} days).", file=sys.stderr)
         sys.exit(1)
     return days
+
+
+MAX_API_DAYS = 90
+
+
+def date_range_chunks(from_date, to_date):
+    """Split a date range into chunks of at most MAX_API_DAYS for FMP API limits."""
+    chunks = []
+    cursor = from_date
+    while cursor < to_date:
+        chunk_end = min(cursor + timedelta(days=MAX_API_DAYS), to_date)
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end
+    return chunks
 
 
 def parse_ticker_file(path):
@@ -110,6 +146,51 @@ def resolve_tickers(args):
         sys.exit(1)
 
     return tickers
+
+
+def fetch_dividends_by_ticker(ticker, from_date, to_date, api_key):
+    """Fetch dividends for a single ticker via /stable/dividends and filter by date range."""
+    url = f"{FMP_BASE_URL}/dividends"
+    params = {"symbol": ticker, "apikey": api_key}
+
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+    except requests.RequestException as e:
+        print(f"Warning: Network error fetching dividends for {ticker}: {e}", file=sys.stderr)
+        return []
+
+    if resp.status_code == 401:
+        print("Error: Invalid FMP API key (HTTP 401).", file=sys.stderr)
+        sys.exit(1)
+    elif resp.status_code == 429:
+        print(f"Warning: Rate limited fetching dividends for {ticker} (HTTP 429). Skipping.", file=sys.stderr)
+        return []
+    elif resp.status_code >= 400:
+        print(f"Warning: HTTP {resp.status_code} fetching dividends for {ticker}. Skipping.", file=sys.stderr)
+        return []
+
+    try:
+        events = resp.json()
+    except ValueError:
+        print(f"Warning: Invalid JSON response for dividends/{ticker}. Skipping.", file=sys.stderr)
+        return []
+
+    if not isinstance(events, list):
+        return []
+
+    from_str = from_date.strftime("%Y-%m-%d")
+    to_str = to_date.strftime("%Y-%m-%d")
+    rows = []
+    for ev in events:
+        d = ev.get("date", "")
+        if from_str <= d <= to_str:
+            rows.append({
+                "date": d,
+                "ticker": ev.get("symbol", ticker).upper(),
+                "event_type": "dividends",
+                "raw": ev,
+            })
+    return rows
 
 
 def fetch_events(event_type, from_date, to_date, api_key):
@@ -312,13 +393,18 @@ def main():
 
     # Parse range
     days = parse_range(args.range_str)
-    from_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    to_date = from_date + timedelta(days=days)
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if days < 0:
+        from_date = today + timedelta(days=days)
+        to_date = today
+    else:
+        from_date = today
+        to_date = today + timedelta(days=days)
 
     # Parse event types
     if args.types:
         types = [t.strip().lower() for t in args.types.split(",")]
-        invalid = [t for t in types if t not in ENDPOINT_MAP]
+        invalid = [t for t in types if t not in ALL_TYPES]
         if invalid:
             print(f"Error: Unknown event types: {', '.join(invalid)}. "
                   f"Valid types: earnings, dividends, splits.", file=sys.stderr)
@@ -328,11 +414,17 @@ def main():
 
     # Fetch and filter
     all_rows = []
+    chunks = date_range_chunks(from_date, to_date)
     for event_type in types:
-        events = fetch_events(event_type, from_date, to_date, api_key)
-        if events is not None:
-            filtered = filter_events(events, tickers, event_type)
-            all_rows.extend(filtered)
+        if event_type == "dividends":
+            for ticker in tickers:
+                all_rows.extend(fetch_dividends_by_ticker(ticker, from_date, to_date, api_key))
+        else:
+            for chunk_from, chunk_to in chunks:
+                events = fetch_events(event_type, chunk_from, chunk_to, api_key)
+                if events is not None:
+                    filtered = filter_events(events, tickers, event_type)
+                    all_rows.extend(filtered)
 
     # Build detail strings
     for row in all_rows:
