@@ -18,12 +18,15 @@ FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 
 ENDPOINT_MAP = {
     "earnings": "earnings-calendar",
+    "dividends": "dividends-calendar",
     "splits": "splits-calendar",
 }
 
 EVENT_TYPE_ORDER = {"earnings": 0, "dividends": 1, "splits": 2}
 
 ALL_TYPES = ["earnings", "dividends", "splits"]
+
+FMP_PAGE_SIZE = 4000
 
 
 def _fix_negative_range(argv):
@@ -91,6 +94,11 @@ def date_range_chunks(from_date, to_date):
         chunks.append((cursor, chunk_end))
         cursor = chunk_end
     return chunks
+
+
+def normalize_symbol(value):
+    """Normalize API and user ticker symbols for matching."""
+    return str(value or "").strip().upper()
 
 
 def parse_ticker_file(path):
@@ -184,59 +192,135 @@ def fetch_dividends_by_ticker(ticker, from_date, to_date, api_key):
     for ev in events:
         d = ev.get("date", "")
         if from_str <= d <= to_str:
+            symbol = normalize_symbol(ev.get("symbol", ticker))
             rows.append({
                 "date": d,
-                "ticker": ev.get("symbol", ticker).upper(),
+                "ticker": symbol,
                 "event_type": "dividends",
                 "raw": ev,
             })
     return rows
 
 
+def handle_response_status(resp, context):
+    """Return True when a response is usable; otherwise warn or exit."""
+    if resp.status_code == 401:
+        print("Error: Invalid FMP API key (HTTP 401).", file=sys.stderr)
+        sys.exit(1)
+    elif resp.status_code == 429:
+        print(f"Warning: Rate limited fetching {context} (HTTP 429). Skipping.", file=sys.stderr)
+        return False
+    elif resp.status_code >= 400:
+        print(f"Warning: HTTP {resp.status_code} fetching {context}. Skipping.", file=sys.stderr)
+        return False
+    return True
+
+
 def fetch_events(event_type, from_date, to_date, api_key):
     """Fetch events from FMP for a given type and date range."""
     endpoint = ENDPOINT_MAP[event_type]
     url = f"{FMP_BASE_URL}/{endpoint}"
+    events = []
+    seen = set()
+    first_page_full = False
+
+    def add_page(page_events):
+        for ev in page_events:
+            if not isinstance(ev, dict):
+                continue
+            key = (
+                normalize_symbol(ev.get("symbol")),
+                ev.get("date", ""),
+                event_type,
+                json.dumps(ev, sort_keys=True, default=str),
+            )
+            if key not in seen:
+                seen.add(key)
+                events.append(ev)
+
+    # FMP's omitted page and explicit page=0 responses are not always equivalent.
     params = {
         "from": from_date.strftime("%Y-%m-%d"),
         "to": to_date.strftime("%Y-%m-%d"),
         "apikey": api_key,
     }
-
     try:
         resp = requests.get(url, params=params, timeout=30)
     except requests.RequestException as e:
         print(f"Warning: Network error fetching {event_type}: {e}", file=sys.stderr)
         return None
 
-    if resp.status_code == 401:
-        print(f"Error: Invalid FMP API key (HTTP 401).", file=sys.stderr)
-        sys.exit(1)
-    elif resp.status_code == 429:
-        print(f"Warning: Rate limited fetching {event_type} (HTTP 429). Skipping.", file=sys.stderr)
-        return None
-    elif resp.status_code >= 400:
-        print(f"Warning: HTTP {resp.status_code} fetching {event_type}. Skipping.", file=sys.stderr)
+    if not handle_response_status(resp, event_type):
         return None
 
     try:
-        return resp.json()
+        page_events = resp.json()
     except ValueError:
         print(f"Warning: Invalid JSON response for {event_type}. Skipping.", file=sys.stderr)
         return None
 
+    if not isinstance(page_events, list):
+        print(f"Warning: Unexpected JSON response for {event_type}. Skipping.", file=sys.stderr)
+        return None
 
-def filter_events(events, ticker_set, event_type):
+    add_page(page_events)
+    first_page_full = len(page_events) >= FMP_PAGE_SIZE
+    if not first_page_full:
+        return events
+
+    page = 0
+    while True:
+        params = {
+            "from": from_date.strftime("%Y-%m-%d"),
+            "to": to_date.strftime("%Y-%m-%d"),
+            "page": page,
+            "apikey": api_key,
+        }
+
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+        except requests.RequestException as e:
+            print(f"Warning: Network error fetching {event_type}: {e}", file=sys.stderr)
+            return None
+
+        if not handle_response_status(resp, event_type):
+            return None
+
+        try:
+            page_events = resp.json()
+        except ValueError:
+            print(f"Warning: Invalid JSON response for {event_type}. Skipping.", file=sys.stderr)
+            return None
+
+        if not isinstance(page_events, list):
+            print(f"Warning: Unexpected JSON response for {event_type}. Skipping.", file=sys.stderr)
+            return None
+
+        if not page_events:
+            break
+
+        add_page(page_events)
+        if len(page_events) < FMP_PAGE_SIZE:
+            break
+        page += 1
+
+    return events
+
+
+def filter_events(events, ticker_set, event_type, from_date, to_date):
     """Keep only events matching the watchlist tickers, attaching event_type."""
     if not events:
         return []
 
+    from_str = from_date.strftime("%Y-%m-%d")
+    to_str = to_date.strftime("%Y-%m-%d")
     rows = []
     for ev in events:
-        symbol = ev.get("symbol", "").upper()
-        if symbol in ticker_set:
+        symbol = normalize_symbol(ev.get("symbol"))
+        date = ev.get("date", "")
+        if symbol in ticker_set and from_str <= date <= to_str:
             rows.append({
-                "date": ev.get("date", ""),
+                "date": date,
                 "ticker": symbol,
                 "event_type": event_type,
                 "raw": ev,
@@ -416,15 +500,11 @@ def main():
     all_rows = []
     chunks = date_range_chunks(from_date, to_date)
     for event_type in types:
-        if event_type == "dividends":
-            for ticker in tickers:
-                all_rows.extend(fetch_dividends_by_ticker(ticker, from_date, to_date, api_key))
-        else:
-            for chunk_from, chunk_to in chunks:
-                events = fetch_events(event_type, chunk_from, chunk_to, api_key)
-                if events is not None:
-                    filtered = filter_events(events, tickers, event_type)
-                    all_rows.extend(filtered)
+        for chunk_from, chunk_to in chunks:
+            events = fetch_events(event_type, chunk_from, chunk_to, api_key)
+            if events is not None:
+                filtered = filter_events(events, tickers, event_type, chunk_from, chunk_to)
+                all_rows.extend(filtered)
 
     # Build detail strings
     for row in all_rows:
